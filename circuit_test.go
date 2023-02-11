@@ -2,6 +2,7 @@ package circuit_test
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -13,12 +14,51 @@ import (
 var ErrBadRequest = errors.New("bad request")
 
 func TestState(t *testing.T) {
-	assert := assert.New(t)
+	t.Run("string", func(t *testing.T) {
+		assert := assert.New(t)
 
-	assert.Equal("closed", circuit.StateClosed.String())
-	assert.Equal("open", circuit.StateOpen.String())
-	assert.Equal("half-open", circuit.StateHalfOpen.String())
-	assert.Equal("", circuit.State(99).String())
+		assert.Equal("closed", circuit.StateClosed.String())
+		assert.Equal("open", circuit.StateOpen.String())
+		assert.Equal("half-open", circuit.StateHalfOpen.String())
+		assert.Equal("", circuit.State(99).String())
+	})
+
+	t.Run("validity", func(t *testing.T) {
+		assert := assert.New(t)
+
+		assert.True(circuit.StateClosed.IsValid())
+		assert.True(circuit.StateOpen.IsValid())
+		assert.True(circuit.StateHalfOpen.IsValid())
+		assert.False(circuit.State(99).IsValid())
+	})
+}
+
+func TestOption(t *testing.T) {
+	t.Run("max success threshold", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("did not panic")
+			}
+		}()
+
+		opt := &circuit.Option{
+			Success: math.MaxUint32 + 1,
+		}
+		_ = circuit.New(opt)
+	})
+
+	t.Run("max failure threshold", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("did not panic")
+			}
+		}()
+
+		opt := &circuit.Option{
+			Failure: math.MaxUint32 + 1,
+		}
+		_ = circuit.New(opt)
+	})
 }
 
 func TestCircuit(t *testing.T) {
@@ -45,22 +85,22 @@ func TestCircuit(t *testing.T) {
 	var errWg sync.WaitGroup
 	errWg.Add(3)
 
-	assert.Nil(circuit.Exec(cb, okHandler))
+	assert.Nil(cb.Exec(okHandler))
 
 	for i := 0; i < 3; i++ {
 		go func() {
 			defer errWg.Done()
 
-			assert.Equal(ErrBadRequest, circuit.Exec(cb, errHandler))
+			assert.Equal(ErrBadRequest, cb.Exec(errHandler))
 			assert.True(cb.State().IsClosed())
 		}()
 	}
 	errWg.Wait()
 
-	assert.Equal(ErrBadRequest, circuit.Exec(cb, errHandler))
+	assert.Equal(ErrBadRequest, cb.Exec(errHandler))
 	assert.True(cb.State().IsOpen())
 
-	assert.Equal(circuit.ErrUnavailable, circuit.Exec(cb, errHandler))
+	assert.Equal(circuit.ErrUnavailable, cb.Exec(errHandler))
 	assert.True(cb.State().IsOpen())
 
 	time.Sleep(cb.AllowAt().Sub(time.Now()))
@@ -72,13 +112,13 @@ func TestCircuit(t *testing.T) {
 		go func() {
 			defer okWg.Done()
 
-			assert.Nil(circuit.Exec(cb, okHandler))
+			assert.Nil(cb.Exec(okHandler))
 			assert.True(cb.State().IsHalfOpen())
 		}()
 	}
 	okWg.Wait()
 
-	assert.Nil(circuit.Exec(cb, okHandler))
+	assert.Nil(cb.Exec(okHandler))
 	assert.True(cb.State().IsClosed())
 }
 

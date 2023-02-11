@@ -14,13 +14,25 @@ var (
 	ErrCircuitBreaker    = errors.New("circuit")
 	ErrUnavailable       = fmt.Errorf("%w: unavailable", ErrCircuitBreaker)
 	ErrThresholdExceeded = fmt.Errorf("%w: max threshold %d exceeded", ErrCircuitBreaker, math.MaxUint16)
+	ErrStateUnknown      = fmt.Errorf("%w: unknown state", ErrCircuitBreaker)
 )
 
 type State uint
 
 const (
+	// StateClosed is the initial state of the circuit breaker. Once a certain
+	// error threshold is reached, the circuit breaker transitions to StateOpen.
 	StateClosed State = iota + 1
+
+	// StateOpen is the state when the circuit breaker timeouts. No calls
+	// can be made and ErrUnavailable will be returned.
+	// After the timeout ends, the circuit breaker transitions to StateHalfOpen.
 	StateOpen
+
+	// StateHalfOpen is the state when the circuit breaker is recovering.
+	// Any failed calls will transition the circuit breaker back to StateOpen.
+	// After n successive calls is made, the circuit breaker transitions back to
+	// StateClosed.
 	StateHalfOpen
 )
 
@@ -37,21 +49,37 @@ func (s State) String() string {
 	}
 }
 
+// IsValid returns true if the state is valid.
+func (s State) IsValid() bool {
+	return s >= StateClosed && s <= StateHalfOpen
+}
+
+// IsOpen returns true if the state is open.
 func (s State) IsOpen() bool {
 	return s == StateOpen
 }
 
+// IsClosed returns true if the state is closed.
 func (s State) IsClosed() bool {
 	return s == StateClosed
 }
 
+// IsHalfOpen returns true if the state is half-open.
 func (s State) IsHalfOpen() bool {
 	return s == StateHalfOpen
 }
 
 type Option struct {
+	// The number of times the call must be successful to change the state from
+	// half-open to closed.
 	Success int64
+
+	// The number of times the call must error to change the state from closed to
+	// open.
 	Failure int64
+
+	// The timeout duration before the next call can be made once the state is
+	// open.
 	Timeout time.Duration
 	Now     func() time.Time
 }
@@ -73,6 +101,7 @@ type CircuitBreaker struct {
 	state   *atomic.Uint64
 }
 
+// New returns a pointer to CircuitBreaker.
 func New(opt *Option) *CircuitBreaker {
 	state := new(atomic.Uint64)
 	state.Store(encode(StateClosed, time.Time{}))
@@ -106,6 +135,7 @@ func (c *CircuitBreaker) State() State {
 	return State(s)
 }
 
+// Counter returns the current counter of the circuit breaker.
 func (c *CircuitBreaker) Counter() int64 {
 	n := c.state.Load()
 	counter, _, _ := decode(n)
@@ -124,7 +154,7 @@ func (c *CircuitBreaker) AllowAt() time.Time {
 // Allow returns true if call can be made.
 func (c *CircuitBreaker) Allow() bool {
 	if c.State().IsOpen() {
-		c.Update(true)
+		c.Update(false)
 	}
 
 	return !c.State().IsOpen()
@@ -138,7 +168,7 @@ func (c *CircuitBreaker) Update(ok bool) {
 	switch State(state) {
 	case StateOpen:
 		if c.now().After(deadline) {
-			c.state.CompareAndSwap(n, encode(StateHalfOpen, deadline))
+			c.state.CompareAndSwap(n, encode(StateHalfOpen, time.Time{}))
 		}
 
 	case StateHalfOpen:
@@ -167,73 +197,72 @@ func (c *CircuitBreaker) Update(ok bool) {
 	}
 }
 
-func (c *CircuitBreaker) nextDeadline() time.Time {
-	// NOTE: Because we are using unix timestamp, the smallest duration is 1s.
-	// However, just adding a timeout of 1s will lead to incorrect result,
-	// because the current milliseconds truncated.
-	// If the current time now is 1.5s, then the next invocation would be 2s,
-	// which is just 500ms apart.
-	// We add 0.5s to make fire at time 3s instead.
-	return c.now().Add(500*time.Millisecond + c.timeout)
-}
-
-type circuitBreaker interface {
-	Allow() bool
-	Update(success bool)
-}
-
-func Exec(cb circuitBreaker, fn func() error) error {
-	if !cb.Allow() {
+// Exec executes and updates the circuit breaker state.
+func (c *CircuitBreaker) Exec(fn func() error) error {
+	if !c.Allow() {
 		return ErrUnavailable
 	}
 
 	if err := fn(); err != nil {
-		cb.Update(false)
-
+		c.Update(false)
 		return err
 	}
 
-	cb.Update(true)
+	c.Update(true)
 
 	return nil
 }
 
-func Query[T any](cb circuitBreaker, fn func() (T, error)) (T, error) {
-	if !cb.Allow() {
-		var t T
-		return t, ErrUnavailable
-	}
-
-	t, err := fn()
-	if err != nil {
-		cb.Update(false)
-
-		return t, err
-	}
-
-	cb.Update(true)
-
-	return t, nil
+// nextDeadline returns the next allowed time for the circuit breaker to fire.
+// NOTE: Because we are using unix timestamp, the smallest duration is 1s.
+// However, just adding a timeout of 1s will lead to incorrect result,
+// because the current milliseconds truncated.
+// If the current time now is 1.5s, then the next invocation would be 2s,
+// which is just 500ms apart.
+// We add 0.5s to make fire at time 3s instead.
+func (c *CircuitBreaker) nextDeadline() time.Time {
+	return c.now().Add(500*time.Millisecond + c.timeout)
 }
 
-func decode(s uint64) (counter int64, state State, deadline time.Time) {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, s)
+func Query[T any](cb interface{ Exec(func() error) error }, fn func() (T, error)) (t T, err error) {
+	err = cb.Exec(func() error {
+		t, err = fn()
+		if err != nil {
+			return err
+		}
 
-	counter = int64(binary.LittleEndian.Uint16(b))
-	state = State(binary.LittleEndian.Uint16(b[2:]))
-	deadline = time.Unix(int64(binary.LittleEndian.Uint32(b[4:])), 0)
+		return nil
+	})
 
 	return
 }
 
+func decode(n uint64) (counter int64, state State, deadline time.Time) {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, n)
+
+	c := binary.LittleEndian.Uint16(b)
+	s := binary.LittleEndian.Uint16(b[2:])
+	d := binary.LittleEndian.Uint32(b[4:])
+
+	counter = int64(c)
+	state = State(s)
+	deadline = time.Unix(int64(d), 0)
+
+	return
+}
+
+// encode encodes the state into a single uint64 atomic state.
+//
+// atomic state (8 bytes) = counter (2 bytes) + state (2 bytes) + unix timestamp (4 bytes)
+//
+// The first 2 bytes is the uint16 counter.
+// The next 2 bytes is the uint16 state (open, half-open, closed).
+// The last 4 bytes is the uint32 unix timestamp representing the deadline.
+//
+// The state only uses 8 bytes, but we don't have the method to read uint8,
+// so the smallest option, uint16 is used instead.
 func encode(state State, deadline time.Time) uint64 {
-	// We can represent uint64 using 8 bytes,
-	// The first 2 bytes is the uint16 counter.
-	// The next 2 bytes is the uint16 state (open, half-open, closed).
-	// The last 4 bytes is the uint32 unix timestamp representing the deadline.
-	// The state only uses 8 bytes, but we don't have the method to read uint8,
-	// so the smallest option, uint16 is used instead.
 	b := make([]byte, 8)
 
 	binary.LittleEndian.PutUint16(b, 0)
