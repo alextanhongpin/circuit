@@ -104,7 +104,7 @@ type Breaker struct {
 // New returns a pointer to Breaker.
 func New(opt *Option) *Breaker {
 	state := new(atomic.Uint64)
-	state.Store(encode(StateClosed, time.Time{}))
+	state.Store(newAtomicState(StateClosed, time.Time{}).Uint64())
 
 	if opt == nil {
 		opt = NewOption()
@@ -129,26 +129,17 @@ func New(opt *Option) *Breaker {
 
 // State returns the Circuit Breaker's state.
 func (c *Breaker) State() State {
-	n := c.state.Load()
-	_, s, _ := decode(n)
-
-	return State(s)
+	return c.atomicState().State()
 }
 
 // Counter returns the current counter of the circuit breaker.
 func (c *Breaker) Counter() int64 {
-	n := c.state.Load()
-	counter, _, _ := decode(n)
-
-	return counter
+	return c.atomicState().Counter()
 }
 
 // AllowAt returns the next available call time.
 func (c *Breaker) AllowAt() time.Time {
-	n := c.state.Load()
-	_, _, deadline := decode(n)
-
-	return deadline
+	return c.atomicState().Deadline()
 }
 
 // Allow returns true if call can be made.
@@ -162,26 +153,24 @@ func (c *Breaker) Allow() bool {
 
 // Update updates the status of the Circuit Breaker.
 func (c *Breaker) Update(ok bool) {
-	n := c.state.Load()
-	_, state, deadline := decode(n)
+	s := c.atomicState()
 
-	switch State(state) {
+	switch s.State() {
 	case StateOpen:
-		if c.now().After(deadline) {
-			c.state.CompareAndSwap(n, encode(StateHalfOpen, time.Time{}))
+		if c.isDeadlineExceeded(s.Deadline()) {
+			c.toHalfOpen(s.Uint64())
 		}
 
 	case StateHalfOpen:
 		if !ok {
-			c.state.CompareAndSwap(n, encode(StateOpen, c.nextDeadline()))
+			c.toOpen(s.Uint64())
 
 			return
 		}
 
 		n := c.state.Add(1)
-		counter, _, _ := decode(n)
-		if int64(counter) > c.success {
-			c.state.CompareAndSwap(n, encode(StateClosed, deadline))
+		if c.isThresholdExceeded(n, c.success) {
+			c.toClosed(n)
 		}
 
 	case StateClosed:
@@ -190,9 +179,8 @@ func (c *Breaker) Update(ok bool) {
 		}
 
 		n := c.state.Add(1)
-		counter, _, _ := decode(n)
-		if int64(counter) > c.failure {
-			c.state.CompareAndSwap(n, encode(StateOpen, c.nextDeadline()))
+		if c.isThresholdExceeded(n, c.failure) {
+			c.toOpen(n)
 		}
 	}
 }
@@ -213,15 +201,36 @@ func (c *Breaker) Exec(fn func() error) error {
 	return nil
 }
 
-// nextDeadline returns the next allowed time for the circuit breaker to fire.
-// NOTE: Because we are using unix timestamp, the smallest duration is 1s.
-// However, just adding a timeout of 1s will lead to incorrect result,
-// because the current milliseconds truncated.
-// If the current time now is 1.5s, then the next invocation would be 2s,
-// which is just 500ms apart.
-// We add 0.5s to make fire at time 3s instead.
-func (c *Breaker) nextDeadline() time.Time {
-	return c.now().Add(500*time.Millisecond + c.timeout)
+func (c *Breaker) atomicState() AtomicState {
+	return newAtomicStateFromUint64(c.state.Load())
+}
+
+func (c *Breaker) isDeadlineExceeded(deadline time.Time) bool {
+	return c.now().After(deadline)
+}
+
+func (c *Breaker) isThresholdExceeded(state uint64, threshold int64) bool {
+	s := newAtomicStateFromUint64(state)
+	return s.Counter() > threshold
+}
+
+func (c *Breaker) toClosed(state uint64) bool {
+	return c.state.CompareAndSwap(state, newAtomicState(StateClosed, time.Time{}).Uint64())
+}
+
+func (c *Breaker) toHalfOpen(state uint64) bool {
+	return c.state.CompareAndSwap(state, newAtomicState(StateHalfOpen, time.Time{}).Uint64())
+}
+
+func (c *Breaker) toOpen(state uint64) bool {
+	// NOTE: Because we are using unix timestamp, the smallest duration is 1s.
+	// However, just adding a timeout of 1s will lead to incorrect result,
+	// because the current milliseconds truncated.
+	// If the current time now is 1.5s, then the next invocation would be 2s,
+	// which is just 500ms apart.
+	// We add 0.5s to make fire at time 3s instead.
+	deadline := c.now().Add(500*time.Millisecond + c.timeout)
+	return c.state.CompareAndSwap(state, newAtomicState(StateOpen, deadline).Uint64())
 }
 
 func Query[T any](cb interface{ Exec(func() error) error }, fn func() (T, error)) (t T, err error) {
@@ -237,22 +246,37 @@ func Query[T any](cb interface{ Exec(func() error) error }, fn func() (T, error)
 	return
 }
 
-func decode(n uint64) (counter int64, state State, deadline time.Time) {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, n)
+type AtomicState [8]byte
 
-	c := binary.LittleEndian.Uint16(b)
-	s := binary.LittleEndian.Uint16(b[2:])
-	d := binary.LittleEndian.Uint32(b[4:])
-
-	counter = int64(c)
-	state = State(s)
-	deadline = time.Unix(int64(d), 0)
-
-	return
+func newAtomicStateFromUint64(n uint64) AtomicState {
+	var b AtomicState
+	binary.LittleEndian.PutUint64(b[:], n)
+	return b
 }
 
-// encode encodes the state into a single uint64 atomic state.
+func (as AtomicState) Uint64() uint64 {
+	return binary.LittleEndian.Uint64(as[:])
+}
+
+func (as AtomicState) Counter() int64 {
+	v := binary.LittleEndian.Uint16(as[:])
+
+	return int64(v)
+}
+
+func (as AtomicState) State() State {
+	v := binary.LittleEndian.Uint16(as[2:])
+
+	return State(v)
+}
+
+func (as AtomicState) Deadline() time.Time {
+	v := binary.LittleEndian.Uint32(as[4:])
+
+	return time.Unix(int64(v), 0)
+}
+
+// newAtomicState encodes the state into a single uint64 atomic state.
 //
 // atomic state (8 bytes) = counter (2 bytes) + state (2 bytes) + unix timestamp (4 bytes)
 //
@@ -262,13 +286,12 @@ func decode(n uint64) (counter int64, state State, deadline time.Time) {
 //
 // The state only uses 8 bytes, but we don't have the method to read uint8,
 // so the smallest option, uint16 is used instead.
-func encode(state State, deadline time.Time) uint64 {
-	b := make([]byte, 8)
+func newAtomicState(state State, deadline time.Time) AtomicState {
+	var b AtomicState
 
-	binary.LittleEndian.PutUint16(b, 0)
+	binary.LittleEndian.PutUint16(b[:], 0)
 	binary.LittleEndian.PutUint16(b[2:], uint16(state))
 	binary.LittleEndian.PutUint32(b[4:], uint32(deadline.Unix()))
 
-	// After writing all the parts, we convert the 8 bytes into uint64.
-	return binary.LittleEndian.Uint64(b)
+	return b
 }
