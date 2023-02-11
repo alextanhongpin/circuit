@@ -110,11 +110,11 @@ func New(opt *Option) *Breaker {
 		opt = NewOption()
 	}
 
-	if opt.Success >= math.MaxUint32 {
+	if opt.Success >= math.MaxUint16 {
 		panic(fmt.Errorf("%w: success count too high", ErrThresholdExceeded))
 	}
 
-	if opt.Failure >= math.MaxUint32 {
+	if opt.Failure >= math.MaxUint16 {
 		panic(fmt.Errorf("%w: failure count too high", ErrThresholdExceeded))
 	}
 
