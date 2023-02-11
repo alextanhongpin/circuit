@@ -93,7 +93,7 @@ func NewOption() *Option {
 	}
 }
 
-type CircuitBreaker struct {
+type Breaker struct {
 	success int64
 	failure int64
 	timeout time.Duration
@@ -101,8 +101,8 @@ type CircuitBreaker struct {
 	state   *atomic.Uint64
 }
 
-// New returns a pointer to CircuitBreaker.
-func New(opt *Option) *CircuitBreaker {
+// New returns a pointer to Breaker.
+func New(opt *Option) *Breaker {
 	state := new(atomic.Uint64)
 	state.Store(encode(StateClosed, time.Time{}))
 
@@ -118,7 +118,7 @@ func New(opt *Option) *CircuitBreaker {
 		panic(fmt.Errorf("%w: failure count too high", ErrThresholdExceeded))
 	}
 
-	return &CircuitBreaker{
+	return &Breaker{
 		success: opt.Success,
 		failure: opt.Failure,
 		timeout: opt.Timeout,
@@ -128,7 +128,7 @@ func New(opt *Option) *CircuitBreaker {
 }
 
 // State returns the Circuit Breaker's state.
-func (c *CircuitBreaker) State() State {
+func (c *Breaker) State() State {
 	n := c.state.Load()
 	_, s, _ := decode(n)
 
@@ -136,7 +136,7 @@ func (c *CircuitBreaker) State() State {
 }
 
 // Counter returns the current counter of the circuit breaker.
-func (c *CircuitBreaker) Counter() int64 {
+func (c *Breaker) Counter() int64 {
 	n := c.state.Load()
 	counter, _, _ := decode(n)
 
@@ -144,7 +144,7 @@ func (c *CircuitBreaker) Counter() int64 {
 }
 
 // AllowAt returns the next available call time.
-func (c *CircuitBreaker) AllowAt() time.Time {
+func (c *Breaker) AllowAt() time.Time {
 	n := c.state.Load()
 	_, _, deadline := decode(n)
 
@@ -152,7 +152,7 @@ func (c *CircuitBreaker) AllowAt() time.Time {
 }
 
 // Allow returns true if call can be made.
-func (c *CircuitBreaker) Allow() bool {
+func (c *Breaker) Allow() bool {
 	if c.State().IsOpen() {
 		c.Update(false)
 	}
@@ -161,7 +161,7 @@ func (c *CircuitBreaker) Allow() bool {
 }
 
 // Update updates the status of the Circuit Breaker.
-func (c *CircuitBreaker) Update(ok bool) {
+func (c *Breaker) Update(ok bool) {
 	n := c.state.Load()
 	_, state, deadline := decode(n)
 
@@ -198,7 +198,7 @@ func (c *CircuitBreaker) Update(ok bool) {
 }
 
 // Exec executes and updates the circuit breaker state.
-func (c *CircuitBreaker) Exec(fn func() error) error {
+func (c *Breaker) Exec(fn func() error) error {
 	if !c.Allow() {
 		return ErrUnavailable
 	}
@@ -220,7 +220,7 @@ func (c *CircuitBreaker) Exec(fn func() error) error {
 // If the current time now is 1.5s, then the next invocation would be 2s,
 // which is just 500ms apart.
 // We add 0.5s to make fire at time 3s instead.
-func (c *CircuitBreaker) nextDeadline() time.Time {
+func (c *Breaker) nextDeadline() time.Time {
 	return c.now().Add(500*time.Millisecond + c.timeout)
 }
 
