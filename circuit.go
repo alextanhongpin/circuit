@@ -222,13 +222,7 @@ func (c *Breaker) toHalfOpen(state uint64) bool {
 }
 
 func (c *Breaker) toOpen(state uint64) bool {
-	// NOTE: Because we are using unix timestamp, the smallest duration is 1s.
-	// However, just adding a timeout of 1s will lead to incorrect result,
-	// because the current milliseconds truncated.
-	// If the current time now is 1.5s, then the next invocation would be 2s,
-	// which is just 500ms apart.
-	// We add 0.5s to make fire at time 3s instead.
-	deadline := c.now().Add(500*time.Millisecond + c.timeout)
+	deadline := c.now().Add(c.timeout)
 	return c.state.CompareAndSwap(state, newAtomicState(StateOpen, deadline).Uint64())
 }
 
@@ -270,9 +264,10 @@ func (as AtomicState) State() State {
 }
 
 func (as AtomicState) Deadline() time.Time {
-	v := binary.LittleEndian.Uint32(as[4:])
+	ms := binary.LittleEndian.Uint16(as[:])
+	ts := binary.LittleEndian.Uint32(as[4:])
 
-	return time.Unix(int64(v), 0)
+	return time.Unix(int64(ts), int64(ms)*1e6)
 }
 
 // newAtomicState encodes the state into a single uint64 atomic state.
@@ -288,7 +283,20 @@ func (as AtomicState) Deadline() time.Time {
 func newAtomicState(state State, deadline time.Time) AtomicState {
 	var b AtomicState
 
-	binary.LittleEndian.PutUint16(b[:], 0)
+	var counter uint16
+
+	// Deadline is non-zero when the state is `open`.
+	// We use the space used to store counter to store the deadline's
+	// milliseconds since counter will be 0.
+	// The additional millisecond is improves the precision of the timeout.
+	if !deadline.IsZero() {
+		// NOTE: Always round up to the nearest millisecond. Otherwise, the timeout
+		// will always complete earlier.
+		ns := deadline.Add(500_000 * time.Nanosecond).Round(1 * time.Millisecond).UnixNano()
+		counter = uint16(ns / 1e6 % 1e3)
+	}
+
+	binary.LittleEndian.PutUint16(b[:], counter)
 	binary.LittleEndian.PutUint16(b[2:], uint16(state))
 	binary.LittleEndian.PutUint32(b[4:], uint32(deadline.Unix()))
 

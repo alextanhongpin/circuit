@@ -103,7 +103,8 @@ func TestCircuit(t *testing.T) {
 	assert.Equal(circuit.ErrUnavailable, cb.Exec(errHandler))
 	assert.True(cb.State().IsOpen())
 
-	time.Sleep(cb.AllowAt().Sub(time.Now()))
+	sleep := cb.AllowAt().Sub(time.Now())
+	time.Sleep(sleep)
 
 	var okWg sync.WaitGroup
 	okWg.Add(3)
