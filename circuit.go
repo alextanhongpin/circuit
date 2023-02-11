@@ -144,45 +144,44 @@ func (c *Breaker) AllowAt() time.Time {
 
 // Allow returns true if call can be made.
 func (c *Breaker) Allow() bool {
-	if c.State().IsOpen() {
-		c.Update(false)
+	if !c.State().IsOpen() {
+		return true
 	}
 
-	return !c.State().IsOpen()
+	return c.Update(false)
 }
 
 // Update updates the status of the Circuit Breaker.
-func (c *Breaker) Update(ok bool) {
+func (c *Breaker) Update(ok bool) bool {
 	s := c.atomicState()
 
 	switch s.State() {
 	case StateOpen:
 		if c.isDeadlineExceeded(s.Deadline()) {
-			c.toHalfOpen(s.Uint64())
+			return c.toHalfOpen(s.Uint64())
 		}
 
 	case StateHalfOpen:
 		if !ok {
-			c.toOpen(s.Uint64())
-
-			return
+			return c.toOpen(s.Uint64())
 		}
 
 		n := c.state.Add(1)
 		if c.isThresholdExceeded(n, c.success) {
-			c.toClosed(n)
+			return c.toClosed(n)
 		}
-
 	case StateClosed:
 		if ok {
-			return
+			return false
 		}
 
 		n := c.state.Add(1)
 		if c.isThresholdExceeded(n, c.failure) {
-			c.toOpen(n)
+			return c.toOpen(n)
 		}
 	}
+
+	return false
 }
 
 // Exec executes and updates the circuit breaker state.
