@@ -11,21 +11,22 @@ import (
 )
 
 var (
-	ErrCircuitBreaker    = errors.New("circuit")
-	ErrUnavailable       = fmt.Errorf("%w: unavailable", ErrCircuitBreaker)
-	ErrThresholdExceeded = fmt.Errorf("%w: max threshold %d exceeded", ErrCircuitBreaker, math.MaxUint16)
-	ErrStateUnknown      = fmt.Errorf("%w: unknown state", ErrCircuitBreaker)
+	ErrCircuitOpen       = errors.New("circuit: circuit open")
+	ErrThresholdExceeded = errors.New("circuit: max threshold exceeded")
+	ErrStateUnknown      = errors.New("circuit: unknown state")
 )
 
 type State uint
 
 const (
+	_ State = iota
+
 	// StateClosed is the initial state of the circuit breaker. Once a certain
 	// error threshold is reached, the circuit breaker transitions to StateOpen.
-	StateClosed State = iota + 1
+	StateClosed
 
 	// StateOpen is the state when the circuit breaker timeouts. No calls
-	// can be made and ErrUnavailable will be returned.
+	// can be made and ErrCircuitOpen will be returned.
 	// After the timeout ends, the circuit breaker transitions to StateHalfOpen.
 	StateOpen
 
@@ -84,6 +85,7 @@ type Option struct {
 	Now     func() time.Time
 }
 
+// NewOption returns a default circuit breaker option.
 func NewOption() *Option {
 	return &Option{
 		Success: 10,
@@ -93,6 +95,7 @@ func NewOption() *Option {
 	}
 }
 
+// Breaker is the circuit breaker implementation.
 type Breaker struct {
 	success int64
 	failure int64
@@ -187,7 +190,7 @@ func (c *Breaker) Update(ok bool) bool {
 // Exec executes and updates the circuit breaker state.
 func (c *Breaker) Exec(fn func() error) error {
 	if !c.Allow() {
-		return ErrUnavailable
+		return ErrCircuitOpen
 	}
 
 	if err := fn(); err != nil {
@@ -239,6 +242,16 @@ func Query[T any](cb interface{ Exec(func() error) error }, fn func() (T, error)
 	return
 }
 
+// AtomicState encodes the state into a single uint64 atomic state.
+//
+// atomic state (8 bytes) = counter (2 bytes) + state (2 bytes) + unix timestamp (4 bytes)
+//
+// The first 2 bytes is the uint16 counter.
+// The next 2 bytes is the uint16 state (open, half-open, closed).
+// The last 4 bytes is the uint32 unix timestamp representing the deadline.
+//
+// The state only uses 8 bytes, but we don't have the method to read uint8,
+// so the smallest option, uint16 is used instead.
 type AtomicState [8]byte
 
 func newAtomicStateFromUint64(n uint64) AtomicState {
@@ -270,22 +283,12 @@ func (as AtomicState) Deadline() time.Time {
 	return time.Unix(int64(ts), int64(ms)*1e6)
 }
 
-// newAtomicState encodes the state into a single uint64 atomic state.
-//
-// atomic state (8 bytes) = counter (2 bytes) + state (2 bytes) + unix timestamp (4 bytes)
-//
-// The first 2 bytes is the uint16 counter.
-// The next 2 bytes is the uint16 state (open, half-open, closed).
-// The last 4 bytes is the uint32 unix timestamp representing the deadline.
-//
-// The state only uses 8 bytes, but we don't have the method to read uint8,
-// so the smallest option, uint16 is used instead.
 func newAtomicState(state State, deadline time.Time) AtomicState {
 	var b AtomicState
 
 	var counter uint16
 
-	// Deadline is non-zero when the state is `open`.
+	// NOTE: Deadline is non-zero when the state is `open`.
 	// We use the space used to store counter to store the deadline's
 	// milliseconds since counter will be 0.
 	// The additional millisecond is improves the precision of the timeout.

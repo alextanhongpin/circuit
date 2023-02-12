@@ -100,7 +100,7 @@ func TestCircuit(t *testing.T) {
 	assert.Equal(ErrBadRequest, cb.Exec(errHandler))
 	assert.True(cb.State().IsOpen())
 
-	assert.Equal(circuit.ErrUnavailable, cb.Exec(errHandler))
+	assert.Equal(circuit.ErrCircuitOpen, cb.Exec(errHandler))
 	assert.True(cb.State().IsOpen())
 
 	sleep := cb.AllowAt().Sub(time.Now())
@@ -165,7 +165,7 @@ func TestQuery(t *testing.T) {
 		}
 		_, err := circuit.Query(cb, handler)
 		assert.NotNil(err)
-		assert.Equal(circuit.ErrUnavailable, err)
+		assert.Equal(circuit.ErrCircuitOpen, err)
 
 		assert.Equal(circuit.StateOpen, cb.State())
 
